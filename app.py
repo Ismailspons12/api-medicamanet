@@ -2,83 +2,149 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
-import os
+import time
+import re
 
 app = Flask(__name__)
-CORS(app)  # Permet les requêtes cross-origin
+CORS(app)  # Permet les appels depuis n'importe quelle origine
 
-def extraire_medicament(code):
-    url = f"https://medicament.ma/?choice=barcode&s={code}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+BASE_URL = "https://medicament.ma"
+
+# -------------------------------------------------------------------
+# 1. Recherche par code-barres (existant, amélioré)
+# -------------------------------------------------------------------
+def extract_by_barcode(code):
+    url = f"{BASE_URL}/?choice=barcode&s={code}"
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return {"erreur": f"Site inaccessible (code {resp.status_code})"}
-        
+        resp = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # Vérifier si la page contient une erreur (par ex. "Aucun résultat")
-        if "Aucun médicament trouvé" in resp.text or soup.find("h1") is None:
-            return {"erreur": "Médicament non trouvé pour ce code-barres"}
-        
-        # Extraction du nom commercial
-        titre = soup.find("h1")
-        nom_commercial = titre.get_text(strip=True) if titre else ""
-        
-        # Initialisation
-        dci = ""
-        dosage = ""
-        
-        # Parcourir tous les paragraphes pour trouver Composition et Dosage
+
+        # Nom commercial
+        nom_tag = soup.find("h1")
+        nom = nom_tag.get_text(strip=True) if nom_tag else ""
+
+        # DCI, Dosage, etc.
+        dci = dosage = forme = ""
         for p in soup.find_all("p"):
             texte = p.get_text(strip=True)
             if "Composition" in texte:
-                # Nettoyer : enlever "Composition" et les ":", puis espaces superflus
                 dci = texte.replace("Composition", "").replace(":", "").strip()
-            elif "Dosage" in texte:
+            if "Dosage" in texte:
                 dosage = texte.replace("Dosage", "").replace(":", "").strip()
-        
-        # Extraction de la forme : on prend la partie après la virgule dans le nom commercial
-        forme = ""
-        if "," in nom_commercial:
-            forme = nom_commercial.split(",")[-1].strip()
-            # Parfois la forme est du type "Solution injectable (SC) en stylo pré-rempli de 1,5 ML"
-            # On garde tel quel, c'est acceptable.
-        
+            if "Présentation" in texte and not forme:
+                # On garde la présentation comme forme si on ne trouve pas mieux
+                forme = texte.replace("Présentation", "").replace(":", "").strip()
+
+        # Extraire la forme depuis le nom (après la virgule)
+        if "," in nom:
+            forme_candidate = nom.split(",")[-1].strip()
+            if forme_candidate and not forme_candidate[0].isdigit():
+                forme = forme_candidate
+
         return {
             "Code CIP": code,
-            "Nom commercial": nom_commercial,
+            "Nom commercial": nom,
             "DCI": dci,
             "Dosage": dosage,
             "Forme": forme
         }
-    
-    except requests.exceptions.Timeout:
-        return {"erreur": "Délai d'attente dépassé"}
-    except requests.exceptions.ConnectionError:
-        return {"erreur": "Erreur de connexion"}
     except Exception as e:
-        return {"erreur": f"Erreur inattendue : {str(e)}"}
+        return {"erreur": f"Erreur lors de l'extraction : {str(e)}"}
 
-@app.route('/scan', methods=['GET'])
-def scan():
+@app.route('/scan')
+def scan_barcode():
     code = request.args.get('code')
     if not code:
-        return jsonify({"erreur": "Paramètre 'code' manquant"}), 400
-    
-    # Nettoyage du code (enlever les espaces éventuels)
-    code = code.strip()
-    
-    resultat = extraire_medicament(code)
-    return jsonify(resultat)
+        return jsonify({"erreur": "Code-barres manquant"}), 400
+    result = extract_by_barcode(code)
+    return jsonify(result)
 
-@app.route('/')
-def index():
-    return "API de recherche de médicaments par code-barres - Utilisez /scan?code=VOTRE_CODE"
+# -------------------------------------------------------------------
+# 2. RECHERCHE PAR NOM (NOUVEAU)
+# -------------------------------------------------------------------
+def search_by_name(term):
+    """
+    Interroge la page de recherche de medicament.ma et retourne la liste
+    des médicaments correspondants avec les informations essentielles.
+    """
+    url = f"{BASE_URL}/?comparison=contains&choice=specialite&keyword=contains&s={term}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
 
+        results = []
+        # Sélecteur approximatif : chercher tous les liens vers des fiches produits
+        # La structure réelle est à adapter si nécessaire
+        product_links = soup.select('a[href*="choice=barcode&s="]')
+
+        for link in product_links:
+            href = link.get('href')
+            # Extraire le code-barres depuis le lien
+            match = re.search(r's=(\d+)', href)
+            if not match:
+                continue
+            code = match.group(1)
+
+            # Le parent contient souvent le nom et d'autres infos
+            parent = link.find_parent(['div', 'article', 'li'])
+            if not parent:
+                continue
+
+            # Nom du médicament (souvent le texte du lien ou un titre proche)
+            nom = link.get_text(strip=True)
+            if not nom:
+                # Chercher un titre dans le parent
+                titre = parent.find(['h2', 'h3', 'strong'])
+                if titre:
+                    nom = titre.get_text(strip=True)
+
+            # Extraire quelques infos supplémentaires (prix, labo, présentation)
+            prix = ""
+            labo = ""
+            presentation = ""
+
+            # Chercher des motifs comme "PPV: 9.10 dhs", "- LAPROPHAN"
+            text_parent = parent.get_text(" ", strip=True)
+            # Prix
+            prix_match = re.search(r'PPV:\s*([\d\s,.]+)\s*dhs', text_parent)
+            if prix_match:
+                prix = prix_match.group(1).replace(" ", "") + " dhs"
+            # Laboratoire (souvent après un tiret)
+            labo_match = re.search(r'-\s*([A-Za-z\s]+?)(?:\s|$)', text_parent)
+            if labo_match:
+                labo = labo_match.group(1).strip()
+            # Présentation (ex: "Boite de 12")
+            pres_match = re.search(r'(Bo[iî]te\s+de\s+\d+)', text_parent, re.IGNORECASE)
+            if pres_match:
+                presentation = pres_match.group(1)
+
+            results.append({
+                "code_barre": code,
+                "nom": nom,
+                "prix": prix,
+                "laboratoire": labo,
+                "presentation": presentation,
+                "url_detail": href if href.startswith('http') else BASE_URL + href
+            })
+
+        # Éviter les doublons (même code)
+        unique = {item['code_barre']: item for item in results}.values()
+        return list(unique)
+
+    except Exception as e:
+        return {"erreur": f"Erreur recherche : {str(e)}"}
+
+@app.route('/search')
+def search():
+    term = request.args.get('name')
+    if not term:
+        return jsonify({"erreur": "Paramètre 'name' manquant"}), 400
+    results = search_by_name(term)
+    return jsonify(results)
+
+# -------------------------------------------------------------------
+# Démarrer le serveur
+# -------------------------------------------------------------------
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=5000)
