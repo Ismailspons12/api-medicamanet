@@ -3,7 +3,6 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 import re
-import time
 
 app = Flask(__name__)
 CORS(app)
@@ -11,9 +10,7 @@ CORS(app)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 BASE_URL = "https://medicament.ma"
 
-# -------------------------------------------------------------------
-# 1. Recherche par code-barres
-# -------------------------------------------------------------------
+# ---------- Scan par code-barres ----------
 def extract_by_barcode(code):
     url = f"{BASE_URL}/?choice=barcode&s={code}"
     try:
@@ -51,9 +48,7 @@ def scan_barcode():
         return jsonify({"erreur": "Code-barres manquant"}), 400
     return jsonify(extract_by_barcode(code))
 
-# -------------------------------------------------------------------
-# 2. RECHERCHE PAR NOM – CORRIGÉE
-# -------------------------------------------------------------------
+# ---------- Recherche par nom ----------
 @app.route('/search')
 def search_by_name():
     term = request.args.get('name')
@@ -64,59 +59,52 @@ def search_by_name():
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
-
         results = []
-        # Méthode plus fiable : chercher les blocs <article> ou <div> contenant les résultats
-        # Sur medicament.ma, les résultats sont souvent dans des <div class="product-item">
-        product_blocks = soup.find_all('div', class_=re.compile('product|item|result|card'))
-
-        if not product_blocks:
-            # Fallback : chercher tous les liens contenant "choice=barcode&s="
-            product_links = soup.find_all('a', href=re.compile(r'choice=barcode&s=\d+'))
-            seen_codes = set()
-            for link in product_links:
-                href = link.get('href', '')
-                match = re.search(r's=(\d+)', href)
-                if not match:
-                    continue
-                code = match.group(1)
-                if code in seen_codes:
-                    continue
-                seen_codes.add(code)
-
-                nom = link.get_text(strip=True)
-                if not nom:
-                    parent = link.find_parent(['div', 'article', 'li'])
-                    if parent:
-                        titre = parent.find(['h2', 'h3', 'strong'])
-                        nom = titre.get_text(strip=True) if titre else ""
-
-                # Extraire le laboratoire et le prix depuis le texte parent
-                labo = ""
-                prix = ""
-                if parent:
-                    text = parent.get_text(" ", strip=True)
-                    # Laboratoire (après un tiret)
-                    labo_match = re.search(r'-\s*([A-Za-z\séèêâîôûïëç]+?)(?:\s|$)', text)
-                    if labo_match:
-                        labo = labo_match.group(1).strip()
-                    # Prix
-                    prix_match = re.search(r'PPV:\s*([\d\s,.]+)\s*dhs', text)
-                    if prix_match:
-                        prix = prix_match.group(1).replace(" ", "") + " dhs"
-
-                results.append({
-                    "code_barre": code,
-                    "nom": nom,
-                    "laboratoire": labo,
-                    "prix": prix,
-                    "url_detail": href if href.startswith('http') else BASE_URL + href
-                })
-
+        items = soup.select('li.listing-item')
+        for item in items:
+            link = item.find('a')
+            if not link:
+                continue
+            href = link.get('href')
+            detail_url = href if href.startswith('http') else BASE_URL + href
+            p_primary = link.find('p', class_='primary')
+            nom = p_primary.get_text(strip=True) if p_primary else ""
+            span_secondary = link.find('span', class_='secondary')
+            labo = prix = presentation = ""
+            if span_secondary:
+                text = span_secondary.get_text(" ", strip=True)
+                labo_match = re.search(r'-\s*([^-\n]+)$', text)
+                if labo_match:
+                    labo = labo_match.group(1).strip()
+                prix_match = re.search(r'PPV:\s*([\d\s,.]+)\s*dhs', text)
+                if prix_match:
+                    prix = prix_match.group(1).replace(" ", "") + " dhs"
+                pres_match = re.search(r'(Bo[iî]te\s+de\s+\d+(?:\s+\w+)?)', text, re.I)
+                if pres_match:
+                    presentation = pres_match.group(1)
+            results.append({
+                "code_barre": "",  # à remplir plus tard
+                "nom": nom,
+                "laboratoire": labo,
+                "prix": prix,
+                "presentation": presentation,
+                "url_detail": detail_url
+            })
         return jsonify(results)
-
     except Exception as e:
-        return jsonify({"erreur": f"Erreur recherche : {str(e)}"}), 500
+        return jsonify({"erreur": str(e)}), 500
+
+# ---------- Debug : page détaillée ----------
+@app.route('/debug-detail')
+def debug_detail():
+    url = request.args.get('url')
+    if not url:
+        return "Paramètre 'url' manquant", 400
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        return resp.text
+    except Exception as e:
+        return f"Erreur: {str(e)}", 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
